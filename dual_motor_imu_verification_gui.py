@@ -153,6 +153,59 @@ def incremental_axis_rotation_deg(
     )
 
 
+def quaternion_euler_axis_deg(q: Quaternion, axis_index: int) -> float:
+    """Return one human-readable Euler component of a quaternion."""
+    return quaternion_to_euler_deg(q)[axis_index]
+
+
+def axis_angle_quaternion(axis_index: int, angle_deg: float) -> Quaternion:
+    """Create a quaternion for a rotation about one BNO085 coordinate axis."""
+    half_angle = math.radians(angle_deg) / 2.0
+    vector = [0.0, 0.0, 0.0]
+    vector[axis_index] = math.sin(half_angle)
+    return math.cos(half_angle), vector[0], vector[1], vector[2]
+
+
+def dual_axis_forward_kinematics(
+    m1_axis_index: int,
+    m1_motor_deg: float,
+    m1_axis_sign: float,
+    m2_axis_index: int,
+    m2_motor_deg: float,
+    m2_axis_sign: float,
+) -> Quaternion:
+    """Return the pose predicted by the two-axis motor forward kinematics.
+
+    Motor positions are in the motor convention. ``IMU_AXIS_SIGN`` converts
+    them to the BNO085 coordinate convention.  The mechanical stack is:
+    ``q_motor = q_M2(axis2) * q_M1(axis1)``.
+    """
+    if m1_axis_index == m2_axis_index:
+        raise ValueError("Dual-axis FK requires two different IMU axes")
+
+    return normalize_quaternion(
+        quaternion_multiply(
+            axis_angle_quaternion(
+                m2_axis_index,
+                m2_motor_deg * m2_axis_sign,
+            ),
+            axis_angle_quaternion(
+                m1_axis_index,
+                m1_motor_deg * m1_axis_sign,
+            ),
+        )
+    )
+
+
+def quaternion_rotation_axis(q: Quaternion) -> Optional[tuple[float, float, float]]:
+    """Return the unit rotation axis, or None when the rotation is zero."""
+    _, qx, qy, qz = normalize_quaternion(q)
+    vector_norm = math.sqrt(qx * qx + qy * qy + qz * qz)
+    if vector_norm < 1e-12:
+        return None
+    return qx / vector_norm, qy / vector_norm, qz / vector_norm
+
+
 class SerialWorker:
     def __init__(self, name: str, port: str, output_queue: queue.Queue):
         self.name = name
@@ -251,10 +304,8 @@ class ActiveTest:
 @dataclass
 class ActiveDualTest:
     m1_axis_name: str
-    m1_axis_key: str
     m1_axis_sign: float
     m2_axis_name: str
-    m2_axis_key: str
     m2_axis_sign: float
 
     m1_direction: int
@@ -264,8 +315,7 @@ class ActiveDualTest:
 
     m1_start_deg: float
     m2_start_deg: float
-    m1_initial_imu_deg: float
-    m2_initial_imu_deg: float
+    initial_q: Quaternion
 
     m1_sample_count: int
     m2_sample_count: int
@@ -1232,15 +1282,17 @@ class App:
 
         axis1_name = self.motor_axis[1].get()
         axis2_name = self.motor_axis[2].get()
-        axis1_key = AXIS_KEY[axis1_name]
-        axis2_key = AXIS_KEY[axis2_name]
+        if axis1_name == axis2_name:
+            messagebox.showerror(
+                "Dual test",
+                "Dual-axis verification requires Motor 1 and Motor 2 to use "
+                "different IMU axes.",
+            )
+            return
 
-        m1_initial = circular_mean_deg(
-            [getattr(sample, axis1_key) for sample in samples[-count1:]]
-        )
-        m2_initial = circular_mean_deg(
-            [getattr(sample, axis2_key) for sample in samples[-count2:]]
-        )
+        # The initial IMU orientation is the common reference pose for the
+        # quaternion comparison after both motors finish their move.
+        initial_q = mean_quaternion([sample.q for sample in samples])
 
         start1 = self.motor_position_deg[1]
         start2 = self.motor_position_deg[2]
@@ -1248,10 +1300,8 @@ class App:
 
         self.active_dual_test = ActiveDualTest(
             m1_axis_name=axis1_name,
-            m1_axis_key=axis1_key,
             m1_axis_sign=IMU_AXIS_SIGN[axis1_name],
             m2_axis_name=axis2_name,
-            m2_axis_key=axis2_key,
             m2_axis_sign=IMU_AXIS_SIGN[axis2_name],
             m1_direction=direction1,
             m2_direction=direction2,
@@ -1259,8 +1309,7 @@ class App:
             m2_requested_deg=angle2,
             m1_start_deg=start1,
             m2_start_deg=start2,
-            m1_initial_imu_deg=m1_initial,
-            m2_initial_imu_deg=m2_initial,
+            initial_q=initial_q,
             m1_sample_count=count1,
             m2_sample_count=count2,
         )
@@ -1386,28 +1435,12 @@ class App:
         if test is None or not test.final_samples:
             return
 
-        m1_samples = test.final_samples[-test.m1_sample_count:]
-        m2_samples = test.final_samples[-test.m2_sample_count:]
+        # Use one common final pose, matching the common initial pose recorded
+        # when the dual test was started.
+        final_q = mean_quaternion([sample.q for sample in test.final_samples])
 
-        m1_final = circular_mean_deg(
-            [getattr(sample, test.m1_axis_key) for sample in m1_samples]
-        )
-        m2_final = circular_mean_deg(
-            [getattr(sample, test.m2_axis_key) for sample in m2_samples]
-        )
-
-        # Same comparison idea as the single-axis verification:
-        # measured rotation = final IMU angle - initial IMU angle,
-        # then apply the configured IMU-axis sign so motor and IMU use
-        # the same clockwise/counterclockwise convention.
-        m1_measured = (
-            angle_difference_deg(test.m1_initial_imu_deg, m1_final)
-            * test.m1_axis_sign
-        )
-        m2_measured = (
-            angle_difference_deg(test.m2_initial_imu_deg, m2_final)
-            * test.m2_axis_sign
-        )
+        m1_axis_index = AXIS_INDEX[test.m1_axis_name]
+        m2_axis_index = AXIS_INDEX[test.m2_axis_name]
 
         m1_command = (
             test.m1_command_deg
@@ -1420,20 +1453,6 @@ class App:
             else test.m2_direction * test.m2_requested_deg
         )
 
-        m1_error = m1_measured - m1_command
-        m2_error = m2_measured - m2_command
-        m1_abs = abs(m1_error)
-        m2_abs = abs(m2_error)
-
-        m1_percent = (
-            m1_abs / abs(m1_command) * 100.0
-            if abs(m1_command) > 1e-9 else math.nan
-        )
-        m2_percent = (
-            m2_abs / abs(m2_command) * 100.0
-            if abs(m2_command) > 1e-9 else math.nan
-        )
-
         end1 = self.motor_position_deg[1]
         end2 = self.motor_position_deg[2]
         if end1 is None:
@@ -1441,108 +1460,123 @@ class App:
         if end2 is None:
             end2 = test.m2_start_deg + m2_command
 
+        # Primary dual-axis measurement: predict each complete motor pose
+        # with FK, compare the resulting pose change with the BNO085 pose
+        # change, then take the shortest quaternion error rotation.  No
+        # inverse-kinematics or per-joint error is used here.
+        q_motor_initial = dual_axis_forward_kinematics(
+            m1_axis_index,
+            test.m1_start_deg,
+            test.m1_axis_sign,
+            m2_axis_index,
+            test.m2_start_deg,
+            test.m2_axis_sign,
+        )
+        q_motor_final = dual_axis_forward_kinematics(
+            m1_axis_index,
+            end1,
+            test.m1_axis_sign,
+            m2_axis_index,
+            end2,
+            test.m2_axis_sign,
+        )
+        q_motor_relative = relative_quaternion(q_motor_initial, q_motor_final)
+        q_imu_relative = relative_quaternion(test.initial_q, final_q)
+        q_error = relative_quaternion(q_motor_relative, q_imu_relative)
+        orientation_error_deg = quaternion_rotation_magnitude_deg(q_error)
+        error_axis = quaternion_rotation_axis(q_error)
+        imu_rotation_magnitude_deg = quaternion_rotation_magnitude_deg(
+            q_imu_relative
+        )
+
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         common_number = len(self.results) + 1
 
-        rows = [
+        # A dual test produces one 3D orientation result, not one result per
+        # motor.  The two motor commands are retained as metadata in this row.
+        self.results.append(
             {
                 "test_number": common_number,
                 "time": now,
-                "test_mode": "Dual",
-                "motor_id": 1,
-                "axis": test.m1_axis_name,
-                "imu_axis_sign": test.m1_axis_sign,
-                "motor_direction": test.m1_direction,
-                "requested_move_deg": test.m1_requested_deg,
-                "actual_step_pulses": test.m1_pulses,
-                "quantized_command_deg": m1_command,
-                "software_start_deg": test.m1_start_deg,
-                "software_end_deg": end1,
-                "initial_euler_reference_deg": test.m1_initial_imu_deg,
-                "final_euler_reference_deg": m1_final,
-                "quaternion_rotation_magnitude_deg": "",
-                "quaternion_axis_projected_deg": "",
-                "integrated_sensor_axis_deg": "",
-                "integrated_motor_axis_deg": "",
-                "measured_signed_rotation_deg": m1_measured,
-                "signed_error_deg": m1_error,
-                "absolute_error_deg": m1_abs,
-                "percent_error": m1_percent,
-            },
-            {
-                "test_number": common_number,
-                "time": now,
-                "test_mode": "Dual",
-                "motor_id": 2,
-                "axis": test.m2_axis_name,
-                "imu_axis_sign": test.m2_axis_sign,
-                "motor_direction": test.m2_direction,
-                "requested_move_deg": test.m2_requested_deg,
-                "actual_step_pulses": test.m2_pulses,
-                "quantized_command_deg": m2_command,
-                "software_start_deg": test.m2_start_deg,
-                "software_end_deg": end2,
-                "initial_euler_reference_deg": test.m2_initial_imu_deg,
-                "final_euler_reference_deg": m2_final,
-                "quaternion_rotation_magnitude_deg": "",
-                "quaternion_axis_projected_deg": "",
-                "integrated_sensor_axis_deg": "",
-                "integrated_motor_axis_deg": "",
-                "measured_signed_rotation_deg": m2_measured,
-                "signed_error_deg": m2_error,
-                "absolute_error_deg": m2_abs,
-                "percent_error": m2_percent,
-            },
-        ]
-        self.results.extend(rows)
+                "test_mode": "Dual FK quaternion",
+                "motor_id": "M1+M2",
+                "m1_axis": test.m1_axis_name,
+                "m1_imu_axis_sign": test.m1_axis_sign,
+                "m1_direction": test.m1_direction,
+                "m1_requested_move_deg": test.m1_requested_deg,
+                "m1_actual_step_pulses": test.m1_pulses,
+                "m1_quantized_command_deg": m1_command,
+                "m1_software_start_deg": test.m1_start_deg,
+                "m1_software_end_deg": end1,
+                "m2_axis": test.m2_axis_name,
+                "m2_imu_axis_sign": test.m2_axis_sign,
+                "m2_direction": test.m2_direction,
+                "m2_requested_move_deg": test.m2_requested_deg,
+                "m2_actual_step_pulses": test.m2_pulses,
+                "m2_quantized_command_deg": m2_command,
+                "m2_software_start_deg": test.m2_start_deg,
+                "m2_software_end_deg": end2,
+                "imu_relative_rotation_magnitude_deg": imu_rotation_magnitude_deg,
+                "fk_predicted_relative_q_w": q_motor_relative[0],
+                "fk_predicted_relative_q_x": q_motor_relative[1],
+                "fk_predicted_relative_q_y": q_motor_relative[2],
+                "fk_predicted_relative_q_z": q_motor_relative[3],
+                "imu_relative_q_w": q_imu_relative[0],
+                "imu_relative_q_x": q_imu_relative[1],
+                "imu_relative_q_y": q_imu_relative[2],
+                "imu_relative_q_z": q_imu_relative[3],
+                "orientation_error_q_w": q_error[0],
+                "orientation_error_q_x": q_error[1],
+                "orientation_error_q_y": q_error[2],
+                "orientation_error_q_z": q_error[3],
+                "orientation_error_deg": orientation_error_deg,
+                "orientation_error_axis_x": "" if error_axis is None else error_axis[0],
+                "orientation_error_axis_y": "" if error_axis is None else error_axis[1],
+                "orientation_error_axis_z": "" if error_axis is None else error_axis[2],
+            }
+        )
 
         result_data = {
-            1: {
-                "axis": test.m1_axis_name,
-                "start": test.m1_start_deg,
-                "end": end1,
-                "direction": test.m1_direction,
-                "requested": test.m1_requested_deg,
-                "pulses": test.m1_pulses,
-                "command": m1_command,
-                "initial": test.m1_initial_imu_deg,
-                "final": m1_final,
-                "measured": m1_measured,
-                "error": m1_error,
-                "absolute": m1_abs,
-                "percent": m1_percent,
+            "motors": {
+                1: {
+                    "axis": test.m1_axis_name,
+                    "start": test.m1_start_deg,
+                    "end": end1,
+                    "direction": test.m1_direction,
+                    "requested": test.m1_requested_deg,
+                    "pulses": test.m1_pulses,
+                    "command": m1_command,
+                },
+                2: {
+                    "axis": test.m2_axis_name,
+                    "start": test.m2_start_deg,
+                    "end": end2,
+                    "direction": test.m2_direction,
+                    "requested": test.m2_requested_deg,
+                    "pulses": test.m2_pulses,
+                    "command": m2_command,
+                },
             },
-            2: {
-                "axis": test.m2_axis_name,
-                "start": test.m2_start_deg,
-                "end": end2,
-                "direction": test.m2_direction,
-                "requested": test.m2_requested_deg,
-                "pulses": test.m2_pulses,
-                "command": m2_command,
-                "initial": test.m2_initial_imu_deg,
-                "final": m2_final,
-                "measured": m2_measured,
-                "error": m2_error,
-                "absolute": m2_abs,
-                "percent": m2_percent,
-            },
+            "motor_relative_q": q_motor_relative,
+            "imu_relative_q": q_imu_relative,
+            "error_q": q_error,
+            "error_axis": error_axis,
+            "orientation_error_deg": orientation_error_deg,
         }
 
         self.active_dual_test = None
         self._set_run_controls(True)
         self.test_state.set("Dual complete")
         self.status.set(
-            f"Dual complete: M1 error {m1_error:+.3f}°, "
-            f"M2 error {m2_error:+.3f}°."
+            f"Dual complete: 3D orientation error {orientation_error_deg:.3f}°."
         )
         self.show_dual_result_window(result_data)
 
-    def show_dual_result_window(self, data: dict[int, dict[str, object]]) -> None:
+    def show_dual_result_window(self, data: dict[str, object]) -> None:
         window = tk.Toplevel(self.root)
         window.title("Dual-Motor Verification Result")
-        window.geometry("760x560")
-        window.minsize(680, 500)
+        window.geometry("790x670")
+        window.minsize(700, 600)
         window.transient(self.root)
 
         outer = ttk.Frame(window, padding=14)
@@ -1552,12 +1586,15 @@ class App:
 
         ttk.Label(
             outer,
-            text="Dual-Motor Verification Result",
-            font=("TkDefaultFont", 12, "bold"),
+            text="Dual-Axis FK Quaternion Verification",
+            font=("TkDefaultFont", 13, "bold"),
         ).grid(row=0, column=0, columnspan=2, pady=(0, 10))
 
+        motors = data["motors"]
+        assert isinstance(motors, dict)
         for col, motor_id in enumerate((1, 2)):
-            item = data[motor_id]
+            item = motors[motor_id]
+            assert isinstance(item, dict)
             panel = ttk.LabelFrame(
                 outer,
                 text=f"Motor {motor_id}  ({item['axis']})",
@@ -1578,7 +1615,6 @@ class App:
             )
             pulses = item["pulses"]
             pulse_text = "--" if pulses is None else str(pulses)
-            percent = float(item["percent"])
 
             fields = [
                 ("Software start", f"{float(item['start']):+.3f}°"),
@@ -1592,24 +1628,6 @@ class App:
                     "Actual motor command",
                     f"{float(item['command']):+.3f}° ({pulse_text} pulses)",
                 ),
-                (
-                    "Initial IMU angle",
-                    f"{float(item['initial']):+.3f}°",
-                ),
-                (
-                    "Final IMU angle",
-                    f"{float(item['final']):+.3f}°",
-                ),
-                (
-                    "Actual IMU rotation",
-                    f"{float(item['measured']):+.3f}°",
-                ),
-                ("Signed error", f"{float(item['error']):+.3f}°"),
-                ("Absolute error", f"{float(item['absolute']):.3f}°"),
-                (
-                    "Percent error",
-                    "N/A" if math.isnan(percent) else f"{percent:.3f}%",
-                ),
             ]
 
             for row, (label, value) in enumerate(fields):
@@ -1620,8 +1638,51 @@ class App:
                     row=row, column=1, sticky="ew", padx=4, pady=5
                 )
 
+        def format_quaternion(q: Quaternion) -> str:
+            return "[" + ", ".join(f"{value:+.6f}" for value in q) + "]"
+
+        q_motor_relative = data["motor_relative_q"]
+        q_imu_relative = data["imu_relative_q"]
+        q_error = data["error_q"]
+        error_axis = data["error_axis"]
+        assert isinstance(q_motor_relative, tuple)
+        assert isinstance(q_imu_relative, tuple)
+        assert isinstance(q_error, tuple)
+        assert error_axis is None or isinstance(error_axis, tuple)
+
+        metric = ttk.LabelFrame(
+            outer,
+            text="Primary 3D Orientation Metric",
+            padding=10,
+        )
+        metric.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(14, 0))
+        metric.columnconfigure(1, weight=1)
+
+        axis_text = (
+            "N/A (zero rotation)"
+            if error_axis is None
+            else "[" + ", ".join(f"{value:+.6f}" for value in error_axis) + "]"
+        )
+        metric_fields = [
+            ("Motor FK predicted Δq", format_quaternion(q_motor_relative)),
+            ("BNO085 measured Δq", format_quaternion(q_imu_relative)),
+            ("Quaternion error Δq", format_quaternion(q_error)),
+            ("Error rotation axis", axis_text),
+            (
+                "3D orientation error",
+                f"{float(data['orientation_error_deg']):.3f}°",
+            ),
+        ]
+        for row, (label, value) in enumerate(metric_fields):
+            ttk.Label(metric, text=label).grid(
+                row=row, column=0, sticky="w", padx=4, pady=5
+            )
+            ttk.Label(metric, text=value, anchor="e").grid(
+                row=row, column=1, sticky="ew", padx=4, pady=5
+            )
+
         button_row = ttk.Frame(outer)
-        button_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        button_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         button_row.columnconfigure(0, weight=1)
         button_row.columnconfigure(1, weight=1)
 
@@ -1661,6 +1722,10 @@ class App:
         axis_component = quaternion_axis_component(q_relative, test.axis_index)
         quaternion_axis_signed = (
             magnitude_deg * axis_component * test.imu_axis_sign
+        )
+        relative_euler_signed = (
+            quaternion_euler_axis_deg(q_relative, test.axis_index)
+            * test.imu_axis_sign
         )
         integrated_motor_signed = (
             test.integrated_sensor_rotation_deg * test.imu_axis_sign
@@ -1712,6 +1777,7 @@ class App:
                 "final_euler_reference_deg": final_euler,
                 "quaternion_rotation_magnitude_deg": magnitude_deg,
                 "quaternion_axis_projected_deg": quaternion_axis_signed,
+                "relative_euler_axis_deg": relative_euler_signed,
                 "integrated_sensor_axis_deg": test.integrated_sensor_rotation_deg,
                 "integrated_motor_axis_deg": integrated_motor_signed,
                 "measured_signed_rotation_deg": measured,
@@ -1758,7 +1824,15 @@ class App:
 
         try:
             with open(filename, "w", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=list(self.results[0].keys()))
+                # Single- and dual-axis tests intentionally record different
+                # metrics.  Keep every available column when both test modes
+                # are exported in one CSV.
+                fieldnames = list(
+                    dict.fromkeys(
+                        key for result in self.results for key in result
+                    )
+                )
+                writer = csv.DictWriter(file, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(self.results)
         except OSError as exc:
