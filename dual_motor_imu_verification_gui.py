@@ -34,6 +34,76 @@ ACCURACY_TEXT = {0: "Unreliable", 1: "Low", 2: "Medium", 3: "High"}
 Quaternion = tuple[float, float, float, float]
 Vector3 = tuple[float, float, float]
 
+# CSV columns are deliberately ordered by how a test is reviewed: common
+# information first, then the single-axis result, followed by dual-axis data.
+# A single CSV can contain both test types; columns that do not apply to a row
+# are intentionally left blank.
+CSV_EXPORT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("test_number", "Test Number"),
+    ("time", "Completed At"),
+    ("test_mode", "Test Mode"),
+    ("motor_id", "Motor ID"),
+    ("axis", "Single: IMU Axis"),
+    ("imu_axis_sign", "Single: IMU Direction Sign"),
+    ("motor_direction", "Single: Motor Direction"),
+    ("requested_move_deg", "Single: Requested Move (deg)"),
+    ("actual_step_pulses", "Single: Actual Step Pulses"),
+    ("quantized_command_deg", "Single: Commanded Move (deg)"),
+    ("software_start_deg", "Single: Start Position (deg)"),
+    ("software_end_deg", "Single: End Position (deg)"),
+    ("initial_euler_reference_deg", "Single: Initial Euler Angle (deg)"),
+    ("final_euler_reference_deg", "Single: Final Euler Angle (deg)"),
+    ("measured_signed_rotation_deg", "Single: IMU Measured Rotation (deg)"),
+    (
+        "directional_error_deg",
+        "Single: Directional Error (deg; - = undershoot, + = overshoot)",
+    ),
+    ("absolute_error_deg", "Single: Absolute Error (deg)"),
+    ("percent_error", "Single: Error (%)"),
+    ("integrated_motor_axis_deg", "Single: Integrated Motor-Axis Angle (deg)"),
+    ("integrated_sensor_axis_deg", "Single: Integrated Sensor-Axis Angle (deg)"),
+    ("quaternion_axis_projected_deg", "Single: Quaternion Projected Angle (deg)"),
+    ("relative_euler_axis_deg", "Single: Relative Euler Angle (deg)"),
+    ("quaternion_rotation_magnitude_deg", "Single: Quaternion Rotation Magnitude (deg)"),
+    ("m1_axis", "Dual M1: IMU Axis"),
+    ("m1_imu_axis_sign", "Dual M1: IMU Direction Sign"),
+    ("m1_direction", "Dual M1: Motor Direction"),
+    ("m1_requested_move_deg", "Dual M1: Requested Move (deg)"),
+    ("m1_actual_step_pulses", "Dual M1: Actual Step Pulses"),
+    ("m1_quantized_command_deg", "Dual M1: Commanded Move (deg)"),
+    ("m1_software_start_deg", "Dual M1: Start Position (deg)"),
+    ("m1_software_end_deg", "Dual M1: End Position (deg)"),
+    ("m2_axis", "Dual M2: IMU Axis"),
+    ("m2_imu_axis_sign", "Dual M2: IMU Direction Sign"),
+    ("m2_direction", "Dual M2: Motor Direction"),
+    ("m2_requested_move_deg", "Dual M2: Requested Move (deg)"),
+    ("m2_actual_step_pulses", "Dual M2: Actual Step Pulses"),
+    ("m2_quantized_command_deg", "Dual M2: Commanded Move (deg)"),
+    ("m2_software_start_deg", "Dual M2: Start Position (deg)"),
+    ("m2_software_end_deg", "Dual M2: End Position (deg)"),
+    ("imu_relative_rotation_magnitude_deg", "Dual: IMU Relative Rotation Magnitude (deg)"),
+    ("orientation_error_deg", "Dual: 3D Orientation Error (deg)"),
+    ("orientation_error_axis_x", "Dual: Error Rotation Axis X"),
+    ("orientation_error_axis_y", "Dual: Error Rotation Axis Y"),
+    ("orientation_error_axis_z", "Dual: Error Rotation Axis Z"),
+    ("fk_predicted_relative_q_w", "Dual: FK Predicted Relative Quaternion W"),
+    ("fk_predicted_relative_q_x", "Dual: FK Predicted Relative Quaternion X"),
+    ("fk_predicted_relative_q_y", "Dual: FK Predicted Relative Quaternion Y"),
+    ("fk_predicted_relative_q_z", "Dual: FK Predicted Relative Quaternion Z"),
+    ("imu_relative_q_w", "Dual: IMU Relative Quaternion W"),
+    ("imu_relative_q_x", "Dual: IMU Relative Quaternion X"),
+    ("imu_relative_q_y", "Dual: IMU Relative Quaternion Y"),
+    ("imu_relative_q_z", "Dual: IMU Relative Quaternion Z"),
+    ("orientation_error_q_w", "Dual: Error Quaternion W"),
+    ("orientation_error_q_x", "Dual: Error Quaternion X"),
+    ("orientation_error_q_y", "Dual: Error Quaternion Y"),
+    ("orientation_error_q_z", "Dual: Error Quaternion Z"),
+)
+
+CSV_QUATERNION_COLUMNS = {
+    key for key, _ in CSV_EXPORT_COLUMNS if "_q_" in key
+}
+
 
 def normalize_quaternion(q: Quaternion) -> Quaternion:
     qw, qx, qy, qz = q
@@ -115,6 +185,19 @@ def circular_mean_deg(values: list[float]) -> float:
 def angle_difference_deg(initial_deg: float, final_deg: float) -> float:
     """Return final - initial wrapped to [-180, 180)."""
     return (final_deg - initial_deg + 180.0) % 360.0 - 180.0
+
+
+def directional_error_deg(measured_deg: float, command_deg: float) -> float:
+    """Return an error where negative is undershoot and positive is overshoot.
+
+    The raw position error is normalized by the command direction, making the
+    sign mean the same thing for clockwise and counterclockwise moves.  A
+    zero-degree command has no direction, so its raw position error is kept.
+    """
+    raw_error = measured_deg - command_deg
+    if abs(command_deg) < 1e-9:
+        return raw_error
+    return math.copysign(1.0, command_deg) * raw_error
 
 
 def relative_quaternion(initial: Quaternion, final: Quaternion) -> Quaternion:
@@ -1065,7 +1148,7 @@ class App:
         self.initial_angle = tk.StringVar(value="--")
         self.final_angle = tk.StringVar(value="--")
         self.measured_rotation = tk.StringVar(value="--")
-        self.signed_error = tk.StringVar(value="--")
+        self.directional_error = tk.StringVar(value="--")
         self.absolute_error = tk.StringVar(value="--")
         self.percent_error = tk.StringVar(value="--")
 
@@ -1311,7 +1394,7 @@ class App:
             ("Initial IMU angle", self.initial_angle),
             ("Final IMU angle", self.final_angle),
             ("Actual IMU rotation", self.measured_rotation),
-            ("Signed error", self.signed_error),
+            ("Directional error (-Under / +Over)", self.directional_error),
             ("Absolute error", self.absolute_error),
             ("Percent error", self.percent_error),
         ]
@@ -2158,7 +2241,7 @@ class App:
         self.initial_angle.set(f"{initial_euler:+.3f}° ({axis_name})")
         self.final_angle.set("--")
         self.measured_rotation.set("--")
-        self.signed_error.set("--")
+        self.directional_error.set("--")
         self.absolute_error.set("--")
         self.percent_error.set("--")
         self.test_state.set("Waiting for ACK")
@@ -2687,8 +2770,11 @@ class App:
         # The final quaternion projection is retained in CSV as a cross-check.
         measured = integrated_motor_signed if test.saw_motion else quaternion_axis_signed
 
-        signed_error = measured - test.command_rotation_deg
-        absolute_error = abs(signed_error)
+        directional_error = directional_error_deg(
+            measured,
+            test.command_rotation_deg,
+        )
+        absolute_error = abs(directional_error)
         percent_error = (
             absolute_error / abs(test.command_rotation_deg) * 100.0
             if abs(test.command_rotation_deg) > 1e-9
@@ -2705,7 +2791,7 @@ class App:
         self.software_end.set(f"{software_end:+.3f}°")
         self.final_angle.set(f"{final_euler:+.3f}° ({test.axis_name})")
         self.measured_rotation.set(f"{measured:+.3f}°")
-        self.signed_error.set(f"{signed_error:+.3f}°")
+        self.directional_error.set(f"{directional_error:+.3f}°")
         self.absolute_error.set(f"{absolute_error:.3f}°")
         self.percent_error.set(
             "N/A" if math.isnan(percent_error) else f"{percent_error:.3f}%"
@@ -2733,7 +2819,7 @@ class App:
                 "integrated_sensor_axis_deg": test.integrated_sensor_rotation_deg,
                 "integrated_motor_axis_deg": integrated_motor_signed,
                 "measured_signed_rotation_deg": measured,
-                "signed_error_deg": signed_error,
+                "directional_error_deg": directional_error,
                 "absolute_error_deg": absolute_error,
                 "percent_error": percent_error,
             }
@@ -2743,7 +2829,7 @@ class App:
         self.status.set(
             f"Motor {test.motor_id} complete: command "
             f"{test.command_rotation_deg:+.3f}°, IMU {measured:+.3f}°, "
-            f"error {signed_error:+.3f}°."
+            f"directional error {directional_error:+.3f}°."
         )
         final_visual_state = OrientationVisualState(
             mode="single",
@@ -2780,6 +2866,21 @@ class App:
             button.configure(state=state)
         self.dual_run_button.configure(state=state)
 
+    @staticmethod
+    def _format_csv_value(column: str, value: object) -> object:
+        """Format numeric CSV data consistently while keeping empty cells empty."""
+        if value is None:
+            return ""
+        if isinstance(value, float):
+            if math.isnan(value):
+                return ""
+            precision = 6 if (
+                column in CSV_QUATERNION_COLUMNS
+                or column.startswith("orientation_error_axis_")
+            ) else 3
+            return f"{value:.{precision}f}"
+        return value
+
     def save_results(self) -> None:
         if not self.results:
             messagebox.showinfo("Save", "No completed results.")
@@ -2796,17 +2897,13 @@ class App:
 
         try:
             with open(filename, "w", newline="", encoding="utf-8") as file:
-                # Single- and dual-axis tests intentionally record different
-                # metrics.  Keep every available column when both test modes
-                # are exported in one CSV.
-                fieldnames = list(
-                    dict.fromkeys(
-                        key for result in self.results for key in result
+                writer = csv.writer(file)
+                writer.writerow(label for _, label in CSV_EXPORT_COLUMNS)
+                for result in self.results:
+                    writer.writerow(
+                        self._format_csv_value(key, result.get(key))
+                        for key, _ in CSV_EXPORT_COLUMNS
                     )
-                )
-                writer = csv.DictWriter(file, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(self.results)
         except OSError as exc:
             messagebox.showerror("Save", str(exc))
             return
