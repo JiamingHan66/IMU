@@ -21,6 +21,7 @@ DEFAULT_AVERAGE_SAMPLES = 50
 MAX_HISTORY = 3000
 FINAL_COLLECTION_TIMEOUT_S = 3.0
 FINAL_POLL_MS = 100
+ORIENTATION_VIEW_UPDATE_INTERVAL_S = 1.0 / 30.0
 
 AXIS_KEY = {"Roll": "roll", "Pitch": "pitch", "Yaw": "yaw"}
 AXIS_INDEX = {"Roll": 0, "Pitch": 1, "Yaw": 2}
@@ -31,6 +32,7 @@ IMU_AXIS_SIGN = {"Roll": -1.0, "Pitch": 1.0, "Yaw": 1.0}
 
 ACCURACY_TEXT = {0: "Unreliable", 1: "Low", 2: "Medium", 3: "High"}
 Quaternion = tuple[float, float, float, float]
+Vector3 = tuple[float, float, float]
 
 
 def normalize_quaternion(q: Quaternion) -> Quaternion:
@@ -206,6 +208,660 @@ def quaternion_rotation_axis(q: Quaternion) -> Optional[tuple[float, float, floa
     return qx / vector_norm, qy / vector_norm, qz / vector_norm
 
 
+def rotate_vector_by_quaternion(q: Quaternion, vector: Vector3) -> Vector3:
+    """Rotate a 3D vector using the same quaternion convention as the IMU."""
+    normalized = normalize_quaternion(q)
+    rotated = quaternion_multiply(
+        quaternion_multiply(normalized, (0.0, vector[0], vector[1], vector[2])),
+        quaternion_conjugate(normalized),
+    )
+    return rotated[1], rotated[2], rotated[3]
+
+
+def rotate_vector_for_visualization(q: Quaternion, vector: Vector3) -> Vector3:
+    """Render the BNO085 orientation in the physical/body viewing direction.
+
+    The BNO085 quaternion is used throughout the measurements as a relative
+    orientation.  For this visual camera, applying it as an active rotation
+    made the physical clockwise motion appear counterclockwise.  Rendering
+    the passive/body form ``q⁻¹ * v * q`` fixes that visual sense without
+    changing any quaternion comparison or result calculation.
+    """
+    return rotate_vector_by_quaternion(quaternion_conjugate(q), vector)
+
+
+@dataclass
+class OrientationVisualState:
+    """Data rendered by the live 3D orientation window."""
+
+    mode: str
+    imu_q: Optional[Quaternion]
+    target_q: Optional[Quaternion]
+    target_label: str
+    imu_label: str
+    status_line: str
+    axis_name: Optional[str] = None
+    target_axis_deg: Optional[float] = None
+    live_axis_deg: Optional[float] = None
+    error_q: Optional[Quaternion] = None
+    error_axis: Optional[Vector3] = None
+    final_error_deg: Optional[float] = None
+    is_final: bool = False
+
+
+class OrientationCanvas(tk.Canvas):
+    """A lightweight quaternion-driven 3D wireframe display for Tkinter."""
+
+    BACKGROUND = "#f8fafc"
+    REFERENCE_COLOR = "#9ca3af"
+    TARGET_COLOR = "#16a34a"
+    IMU_COLOR = "#2563eb"
+    ERROR_COLOR = "#c026d3"
+    ROTATION_AXIS_COLOR = "#7c3aed"
+    AXIS_COLORS = ("#dc2626", "#16a34a", "#2563eb")
+
+    def __init__(self, parent: tk.Misc):
+        super().__init__(
+            parent,
+            background=self.BACKGROUND,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.state: Optional[OrientationVisualState] = None
+        self.bind("<Configure>", lambda _event: self.redraw())
+
+    def set_state(self, state: OrientationVisualState) -> None:
+        self.state = state
+        self.redraw()
+
+    @staticmethod
+    def _format_quaternion(q: Quaternion) -> str:
+        return "[" + ", ".join(f"{value:+.4f}" for value in q) + "]"
+
+    @staticmethod
+    def _format_axis(axis: Vector3) -> str:
+        return "[" + ", ".join(f"{value:+.3f}" for value in axis) + "]"
+
+    @staticmethod
+    def _project(
+        vector: Vector3,
+        center_x: float,
+        center_y: float,
+        scale: float,
+    ) -> tuple[float, float]:
+        """Project the physical IMU axes with +Y left and +Z up.
+
+        The display camera looks from negative X toward positive X.  Therefore
+        +X points into the page, +Y points left, and +Z remains up.  This is a
+        right-handed visual frame.  A small perspective term makes positive-X
+        surfaces appear farther away; a depth-only X vector is rendered as
+        ``⊗`` (into page) or ``⊙`` (out of page).
+        """
+        x, y, z = vector
+        perspective = 1.0 - 0.18 * x
+        return (
+            center_x - scale * y * perspective,
+            center_y - scale * z * perspective,
+        )
+
+    @staticmethod
+    def _clamp_signed_angle(angle_deg: float) -> float:
+        return max(-180.0, min(180.0, angle_deg))
+
+    def _draw_arrow(
+        self,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        *,
+        color: str,
+        width: int = 2,
+        dash: Optional[tuple[int, int]] = None,
+    ) -> None:
+        options: dict[str, object] = {
+            "fill": color,
+            "width": width,
+            "arrow": tk.LAST,
+            "arrowshape": (8, 10, 3),
+        }
+        if dash is not None:
+            options["dash"] = dash
+        self.create_line(*start, *end, **options)
+
+    def _draw_out_of_page_marker(
+        self,
+        point: tuple[float, float],
+        *,
+        color: str,
+        points_out_of_page: bool,
+        label: str,
+    ) -> None:
+        """Draw the conventional ⊙ / ⊗ symbol for a nearly depth-only axis."""
+        x, y = point
+        radius = 7
+        self.create_oval(
+            x - radius,
+            y - radius,
+            x + radius,
+            y + radius,
+            outline=color,
+            fill="#ffffff",
+            width=2,
+        )
+        if points_out_of_page:
+            self.create_oval(
+                x - 2.5,
+                y - 2.5,
+                x + 2.5,
+                y + 2.5,
+                outline=color,
+                fill=color,
+            )
+            suffix = "⊙"
+        else:
+            self.create_line(x - 3.5, y - 3.5, x + 3.5, y + 3.5, fill=color, width=2)
+            self.create_line(x - 3.5, y + 3.5, x + 3.5, y - 3.5, fill=color, width=2)
+            suffix = "⊗"
+        self.create_text(
+            x + 20,
+            y + 13,
+            text=f"{label} {suffix}",
+            fill=color,
+            font=("TkDefaultFont", 9, "bold"),
+        )
+
+    def _draw_colored_axis_vector(
+        self,
+        origin: tuple[float, float],
+        endpoint: tuple[float, float],
+        direction: Vector3,
+        *,
+        label: str,
+        color: str,
+        vector_dash: tuple[int, int] = (5, 4),
+    ) -> None:
+        """Draw a colored dashed coordinate or quaternion-axis vector."""
+        dx = endpoint[0] - origin[0]
+        dy = endpoint[1] - origin[1]
+        screen_length = math.hypot(dx, dy)
+
+        # In this view an X-aligned vector has no 2D length.  Preserve its
+        # physical direction with the standard out-of-page/in-to-page glyph.
+        if screen_length < 8.0:
+            self._draw_out_of_page_marker(
+                origin,
+                color=color,
+                points_out_of_page=direction[0] <= 0.0,
+                label=label,
+            )
+            return
+
+        self.create_line(
+            *origin,
+            *endpoint,
+            fill=color,
+            width=2,
+            dash=vector_dash,
+        )
+        arrow_tail_fraction = max(0.0, 1.0 - 20.0 / screen_length)
+        arrow_start = (
+            origin[0] + arrow_tail_fraction * dx,
+            origin[1] + arrow_tail_fraction * dy,
+        )
+        self._draw_arrow(
+            arrow_start,
+            endpoint,
+            color=color,
+            width=3,
+        )
+        label_offset_x = 8 if dx >= 0.0 else -8
+        label_anchor = "w" if dx >= 0.0 else "e"
+        label_offset_y = -11 if dy <= 0.0 else 11
+        self.create_text(
+            endpoint[0] + label_offset_x,
+            endpoint[1] + label_offset_y,
+            text=label,
+            anchor=label_anchor,
+            fill=color,
+            font=("TkDefaultFont", 9, "bold"),
+        )
+
+    def _draw_reference_axes(
+        self,
+        center_x: float,
+        center_y: float,
+        scale: float,
+    ) -> None:
+        origin = self._project((0.0, 0.0, 0.0), center_x, center_y, scale)
+        for vector, label in zip(
+            ((0.85, 0.0, 0.0), (0.0, 0.85, 0.0), (0.0, 0.0, 0.85)),
+            ("X", "Y", "Z"),
+        ):
+            endpoint = self._project(vector, center_x, center_y, scale)
+            if math.dist(origin, endpoint) < 8.0:
+                self._draw_out_of_page_marker(
+                    origin,
+                    color=self.REFERENCE_COLOR,
+                    points_out_of_page=vector[0] <= 0.0,
+                    label=label,
+                )
+            else:
+                self.create_line(
+                    *origin,
+                    *endpoint,
+                    fill=self.REFERENCE_COLOR,
+                    width=1,
+                    dash=(3, 4),
+                )
+
+    def _draw_pose(
+        self,
+        center_x: float,
+        center_y: float,
+        scale: float,
+        q: Quaternion,
+        *,
+        color: str,
+        dash: Optional[tuple[int, int]],
+    ) -> None:
+        # A thin rectangular platform gives the orientation axes a clear body.
+        top = [
+            (-0.62, -0.45, 0.12),
+            (0.62, -0.45, 0.12),
+            (0.62, 0.45, 0.12),
+            (-0.62, 0.45, 0.12),
+        ]
+        bottom = [(x, y, -0.12) for x, y, _ in top]
+        corners = [
+            self._project(
+                rotate_vector_for_visualization(q, point),
+                center_x,
+                center_y,
+                scale,
+            )
+            for point in top + bottom
+        ]
+        edge_options: dict[str, object] = {"fill": color, "width": 2}
+        if dash is not None:
+            edge_options["dash"] = dash
+
+        for start, end in (
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ):
+            self.create_line(*corners[start], *corners[end], **edge_options)
+
+        origin = self._project((0.0, 0.0, 0.0), center_x, center_y, scale)
+        for label, vector, axis_color in zip(
+            ("X", "Y", "Z"),
+            ((0.95, 0.0, 0.0), (0.0, 0.95, 0.0), (0.0, 0.0, 0.95)),
+            self.AXIS_COLORS,
+        ):
+            direction = rotate_vector_for_visualization(q, vector)
+            endpoint = self._project(
+                direction,
+                center_x,
+                center_y,
+                scale,
+            )
+            self._draw_colored_axis_vector(
+                origin,
+                endpoint,
+                direction,
+                label=label,
+                color=axis_color,
+            )
+
+    def _rotation_axis_text(self, q: Quaternion, label: str) -> str:
+        """Format a final-result-only quaternion rotation-axis annotation."""
+        angle_deg = quaternion_rotation_magnitude_deg(q)
+        axis = quaternion_rotation_axis(q)
+        if axis is None or angle_deg < 0.25:
+            return f"{label}: N/A (rotation below 0.25 deg)"
+        return (
+            f"{label} = {self._format_axis(axis)}, "
+            f"angle = {angle_deg:.2f} deg"
+        )
+
+    def _draw_pose_panel(
+        self,
+        center_x: float,
+        center_y: float,
+        scale: float,
+        q: Quaternion,
+        *,
+        title: str,
+        color: str,
+        dashed: bool,
+        rotation_axis_label: Optional[str] = None,
+        panel_half_width: Optional[float] = None,
+        panel_half_height: Optional[float] = None,
+    ) -> None:
+        if panel_half_width is None:
+            panel_half_width = scale * 1.55
+        if panel_half_height is None:
+            panel_half_height = scale * 1.35
+
+        panel_top = center_y - panel_half_height
+        panel_bottom = center_y + panel_half_height
+        text_width = max(1, int(2.0 * panel_half_width - 24.0))
+        self.create_rectangle(
+            center_x - panel_half_width,
+            panel_top,
+            center_x + panel_half_width,
+            panel_bottom,
+            outline="#d1d5db",
+            fill="#ffffff",
+            width=1,
+        )
+        self.create_text(
+            center_x,
+            panel_top + 10,
+            text=title,
+            anchor="n",
+            width=text_width,
+            justify="center",
+            fill=color,
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        self._draw_reference_axes(center_x, center_y + 8, scale)
+        self._draw_pose(
+            center_x,
+            center_y + 8,
+            scale,
+            q,
+            color=color,
+            dash=(5, 4) if dashed else None,
+        )
+        if rotation_axis_label is not None:
+            self.create_text(
+                center_x,
+                panel_bottom - 28,
+                text=self._rotation_axis_text(q, rotation_axis_label),
+                anchor="s",
+                width=text_width,
+                justify="center",
+                fill=self.ROTATION_AXIS_COLOR,
+                font=("TkFixedFont", 8),
+            )
+        self.create_text(
+            center_x,
+            panel_bottom - 8,
+            text=f"data q = {self._format_quaternion(q)}",
+            anchor="s",
+            width=text_width,
+            justify="center",
+            fill="#334155",
+            font=("TkFixedFont", 8),
+        )
+
+    def _draw_single_axis_dial(self, state: OrientationVisualState, width: int, height: int) -> None:
+        if state.target_axis_deg is None or state.live_axis_deg is None:
+            return
+
+        center_x = width / 2.0
+        center_y = height - 66.0
+        half_width = min(width * 0.34, 290.0)
+        self.create_text(
+            center_x,
+            center_y - 35,
+            text=f"{state.axis_name} rotation: target vs live IMU",
+            fill="#0f172a",
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        self.create_line(
+            center_x - half_width,
+            center_y,
+            center_x + half_width,
+            center_y,
+            fill="#94a3b8",
+            width=3,
+        )
+        for angle_deg in (-180, -90, 0, 90, 180):
+            x = center_x + half_width * angle_deg / 180.0
+            self.create_line(x, center_y - 6, x, center_y + 6, fill="#64748b", width=1)
+            self.create_text(
+                x,
+                center_y + 17,
+                text=f"{angle_deg:+d}°",
+                fill="#64748b",
+                font=("TkDefaultFont", 8),
+            )
+
+        def marker_x(angle_deg: float) -> float:
+            return center_x + half_width * self._clamp_signed_angle(angle_deg) / 180.0
+
+        target_x = marker_x(state.target_axis_deg)
+        live_x = marker_x(state.live_axis_deg)
+        self.create_line(
+            target_x,
+            center_y - 27,
+            target_x,
+            center_y + 5,
+            fill=self.TARGET_COLOR,
+            width=3,
+            dash=(5, 4),
+        )
+        self.create_line(
+            live_x,
+            center_y - 6,
+            live_x,
+            center_y + 27,
+            fill=self.IMU_COLOR,
+            width=4,
+        )
+        self.create_text(
+            center_x - half_width,
+            center_y - 18,
+            anchor="w",
+            text=f"Target: {state.target_axis_deg:+.2f}°",
+            fill=self.TARGET_COLOR,
+            font=("TkDefaultFont", 9, "bold"),
+        )
+        self.create_text(
+            center_x + half_width,
+            center_y - 18,
+            anchor="e",
+            text=f"Live IMU: {state.live_axis_deg:+.2f}°",
+            fill=self.IMU_COLOR,
+            font=("TkDefaultFont", 9, "bold"),
+        )
+
+    def _draw_dual_summary(self, state: OrientationVisualState, width: int, height: int) -> None:
+        top = height - 130
+        self.create_rectangle(18, top, width - 18, height - 16, outline="#d1d5db", fill="#ffffff")
+        if state.is_final and state.final_error_deg is not None:
+            title = f"Final 3D orientation error: {state.final_error_deg:.3f}°"
+            detail = "This is Δq_FK⁻¹ ⊗ Δq_IMU after stationary IMU averaging."
+            self.create_text(
+                width * 0.34,
+                top + 27,
+                text=title,
+                fill=self.ERROR_COLOR,
+                font=("TkDefaultFont", 12, "bold"),
+            )
+            self.create_text(
+                width * 0.34,
+                top + 53,
+                text=detail,
+                fill="#475569",
+                font=("TkDefaultFont", 9),
+            )
+            if state.error_q is not None:
+                self.create_text(
+                    width * 0.34,
+                    top + 78,
+                    text=f"q_error = {self._format_quaternion(state.error_q)}",
+                    fill="#334155",
+                    font=("TkFixedFont", 8),
+                )
+            if state.error_axis is not None:
+                self.create_text(
+                    width * 0.34,
+                    top + 104,
+                    text=(
+                        f"q_error rotation axis = {self._format_axis(state.error_axis)} "
+                        f"(angle = {state.final_error_deg:.3f} deg)"
+                    ),
+                    fill=self.ERROR_COLOR,
+                    font=("TkDefaultFont", 8, "bold"),
+                )
+        else:
+            self.create_text(
+                width / 2.0,
+                top + 33,
+                text="Live dual-axis view",
+                fill="#0f172a",
+                font=("TkDefaultFont", 11, "bold"),
+            )
+            self.create_text(
+                width / 2.0,
+                top + 59,
+                text=(
+                    "Green is the final open-loop FK target; blue is the live BNO085 pose. "
+                    "Final quaternion error is calculated after DONE and stationary averaging."
+                ),
+                fill="#475569",
+                font=("TkDefaultFont", 9),
+            )
+
+    def redraw(self) -> None:
+        self.delete("all")
+        state = self.state
+        width = max(self.winfo_width(), 680)
+        height = max(self.winfo_height(), 440)
+
+        if state is None or state.imu_q is None:
+            self.create_text(
+                width / 2.0,
+                height / 2.0,
+                text="Waiting for BNO085 quaternion data…",
+                fill="#475569",
+                font=("TkDefaultFont", 13),
+            )
+            return
+
+        if state.mode == "idle":
+            self.create_text(
+                width / 2.0,
+                22,
+                text="Live BNO085 orientation (world reference; +Y left, +X ⊗ into page)",
+                fill="#0f172a",
+                font=("TkDefaultFont", 12, "bold"),
+            )
+            scale = min(width * 0.17, height * 0.28, 130.0)
+            self._draw_pose_panel(
+                width / 2.0,
+                height * 0.48,
+                scale,
+                state.imu_q,
+                title=state.imu_label,
+                color=self.IMU_COLOR,
+                dashed=False,
+            )
+            self.create_text(
+                width / 2.0,
+                height - 30,
+                text=(
+                    "View convention: +Y left, +Z up, +X ⊗ into page. "
+                    "RGB dashed arrows are the rotating local X/Y/Z vectors."
+                ),
+                fill="#475569",
+                font=("TkDefaultFont", 9),
+            )
+            return
+
+        if state.target_q is None:
+            return
+
+        heading = (
+            "Single-axis live orientation"
+            if state.mode == "single"
+            else "Dual-axis FK quaternion comparison"
+        )
+        self.create_text(
+            width / 2.0,
+            20,
+            text=heading,
+            fill="#0f172a",
+            font=("TkDefaultFont", 12, "bold"),
+        )
+        self.create_text(
+            width / 2.0,
+            39,
+            text=(
+                "Gray = initial reference   Green dashed body = model target   "
+                "Blue body = BNO085 IMU   RGB dashed = rotating X/Y/Z"
+            ),
+            fill="#475569",
+            font=("TkDefaultFont", 9),
+        )
+
+        show_final_dual_axis = state.mode == "dual" and state.is_final
+        panel_half_width: Optional[float] = None
+        panel_half_height: Optional[float] = None
+
+        if state.mode == "dual":
+            # The final dual-axis annotations are deliberately kept inside a
+            # wide panel: two long q-axis rows need substantially more room
+            # than the wireframe itself.
+            side_margin = 22.0
+            panel_gap = 28.0
+            panel_top = 62.0
+            panel_bottom = height - 148.0
+            panel_width = (width - 2.0 * side_margin - panel_gap) / 2.0
+            panel_half_width = max(1.0, panel_width / 2.0)
+            panel_half_height = max(1.0, (panel_bottom - panel_top) / 2.0)
+            target_center_x = side_margin + panel_half_width
+            imu_center_x = width - side_margin - panel_half_width
+            center_y = (panel_top + panel_bottom) / 2.0
+            scale = min(
+                108.0,
+                panel_half_width * 0.62,
+                max(40.0, panel_half_height - 62.0),
+            )
+        else:
+            panel_height = height - 160.0
+            scale = min(width * 0.115, panel_height * 0.28, 108.0)
+            target_center_x = width * 0.27
+            imu_center_x = width * 0.73
+            center_y = 54.0 + panel_height / 2.0
+
+        self._draw_pose_panel(
+            target_center_x,
+            center_y,
+            scale,
+            state.target_q,
+            title=state.target_label,
+            color=self.TARGET_COLOR,
+            dashed=True,
+            rotation_axis_label=(
+                "FK q rotation axis" if show_final_dual_axis else None
+            ),
+            panel_half_width=panel_half_width,
+            panel_half_height=panel_half_height,
+        )
+        self._draw_pose_panel(
+            imu_center_x,
+            center_y,
+            scale,
+            state.imu_q,
+            title=state.imu_label,
+            color=self.IMU_COLOR,
+            dashed=False,
+            rotation_axis_label=(
+                "BNO085 q rotation axis" if show_final_dual_axis else None
+            ),
+            panel_half_width=panel_half_width,
+            panel_half_height=panel_half_height,
+        )
+
+        if state.mode == "single":
+            self._draw_single_axis_dial(state, width, height)
+        else:
+            self._draw_dual_summary(state, width, height)
+
+
 class SerialWorker:
     def __init__(self, name: str, port: str, output_queue: queue.Queue):
         self.name = name
@@ -350,6 +1006,11 @@ class App:
         self.active_dual_test: Optional[ActiveDualTest] = None
         self.results: list[dict[str, object]] = []
         self.run_buttons: dict[int, ttk.Button] = {}
+        self.orientation_window: Optional[tk.Toplevel] = None
+        self.orientation_canvas: Optional[OrientationCanvas] = None
+        self.orientation_status: Optional[tk.StringVar] = None
+        self._pinned_orientation_state: Optional[OrientationVisualState] = None
+        self._last_orientation_view_update_at = 0.0
 
         self._variables()
         self._layout()
@@ -623,6 +1284,19 @@ class App:
         for row, (label, variable) in enumerate(live_fields):
             self._value_row(live, row, label, variable)
 
+        ttk.Button(
+            live,
+            text="Open Live 3D View",
+            command=self.show_orientation_view,
+        ).grid(
+            row=len(live_fields),
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            padx=4,
+            pady=(10, 4),
+        )
+
         result = ttk.LabelFrame(outer, text="4. Latest Verification Result", padding=10)
         result.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         result.columnconfigure(1, weight=1)
@@ -678,6 +1352,261 @@ class App:
         ttk.Label(parent, textvariable=variable, anchor="e").grid(
             row=row, column=1, sticky="ew", padx=4, pady=3
         )
+
+    def show_orientation_view(self) -> None:
+        """Open the continuously updated quaternion orientation display."""
+        if self.orientation_window is not None:
+            try:
+                if self.orientation_window.winfo_exists():
+                    self.orientation_window.deiconify()
+                    self.orientation_window.lift()
+                    self.orientation_window.focus_force()
+                    self._update_orientation_visualization(force=True)
+                    return
+            except tk.TclError:
+                pass
+
+        window = tk.Toplevel(self.root)
+        window.title("Live IMU Orientation View")
+        window.geometry("1280x760")
+        window.minsize(1120, 640)
+        window.transient(self.root)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+        window.protocol("WM_DELETE_WINDOW", self._close_orientation_view)
+
+        ttk.Label(
+            window,
+            text="Quaternion-driven live orientation visualization",
+            font=("TkDefaultFont", 12, "bold"),
+            padding=(12, 10, 12, 4),
+        ).grid(row=0, column=0, sticky="w")
+
+        canvas = OrientationCanvas(window)
+        canvas.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+
+        footer = ttk.Frame(window, padding=(12, 0, 12, 10))
+        footer.grid(row=2, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+
+        status = tk.StringVar(value="Waiting for BNO085 quaternion data.")
+        ttk.Label(footer, textvariable=status, anchor="w").grid(
+            row=0, column=0, sticky="ew", padx=(0, 10)
+        )
+        ttk.Button(
+            footer,
+            text="Show Current Live Pose",
+            command=self._show_current_live_orientation,
+        ).grid(row=0, column=1, padx=4)
+        ttk.Button(
+            footer,
+            text="Close",
+            command=self._close_orientation_view,
+        ).grid(row=0, column=2, padx=(4, 0))
+
+        self.orientation_window = window
+        self.orientation_canvas = canvas
+        self.orientation_status = status
+        self._update_orientation_visualization(force=True)
+
+    def _close_orientation_view(self) -> None:
+        window = self.orientation_window
+        self.orientation_window = None
+        self.orientation_canvas = None
+        self.orientation_status = None
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+    def _show_current_live_orientation(self) -> None:
+        self._pinned_orientation_state = None
+        self._update_orientation_visualization(force=True)
+
+    @staticmethod
+    def _single_axis_rotation_from_quaternion(
+        q_relative: Quaternion,
+        axis_index: int,
+        axis_sign: float,
+    ) -> float:
+        return (
+            quaternion_rotation_magnitude_deg(q_relative)
+            * quaternion_axis_component(q_relative, axis_index)
+            * axis_sign
+        )
+
+    @staticmethod
+    def _dual_command_rotations(test: ActiveDualTest) -> tuple[float, float]:
+        m1_command = (
+            test.m1_command_deg
+            if test.m1_command_deg is not None
+            else test.m1_direction * test.m1_requested_deg
+        )
+        m2_command = (
+            test.m2_command_deg
+            if test.m2_command_deg is not None
+            else test.m2_direction * test.m2_requested_deg
+        )
+        return m1_command, m2_command
+
+    @staticmethod
+    def _dual_fk_relative_quaternion(
+        test: ActiveDualTest,
+        m1_end_deg: float,
+        m2_end_deg: float,
+    ) -> Quaternion:
+        m1_axis_index = AXIS_INDEX[test.m1_axis_name]
+        m2_axis_index = AXIS_INDEX[test.m2_axis_name]
+        q_motor_initial = dual_axis_forward_kinematics(
+            m1_axis_index,
+            test.m1_start_deg,
+            test.m1_axis_sign,
+            m2_axis_index,
+            test.m2_start_deg,
+            test.m2_axis_sign,
+        )
+        q_motor_final = dual_axis_forward_kinematics(
+            m1_axis_index,
+            m1_end_deg,
+            test.m1_axis_sign,
+            m2_axis_index,
+            m2_end_deg,
+            test.m2_axis_sign,
+        )
+        return relative_quaternion(q_motor_initial, q_motor_final)
+
+    def _single_orientation_visual_state(
+        self,
+        test: ActiveTest,
+        sample: Optional[ImuSample],
+    ) -> OrientationVisualState:
+        q_imu_relative = (
+            relative_quaternion(test.initial_q, sample.q)
+            if sample is not None
+            else (1.0, 0.0, 0.0, 0.0)
+        )
+        q_target = axis_angle_quaternion(
+            test.axis_index,
+            test.command_rotation_deg * test.imu_axis_sign,
+        )
+        live_axis_deg = (
+            test.integrated_sensor_rotation_deg * test.imu_axis_sign
+            if test.saw_motion
+            else self._single_axis_rotation_from_quaternion(
+                q_imu_relative,
+                test.axis_index,
+                test.imu_axis_sign,
+            )
+        )
+        target_source = (
+            "Quantized command target"
+            if test.actual_pulses is not None
+            else "Requested command target"
+        )
+        return OrientationVisualState(
+            mode="single",
+            imu_q=q_imu_relative,
+            target_q=q_target,
+            target_label=f"{target_source} Δq",
+            imu_label="BNO085 live Δq",
+            status_line=(
+                "Live IMU pose is relative to the stationary pose captured at test start. "
+                "The green target is the selected-axis motor command."
+            ),
+            axis_name=test.axis_name,
+            target_axis_deg=test.command_rotation_deg,
+            live_axis_deg=live_axis_deg,
+        )
+
+    def _dual_orientation_visual_state(
+        self,
+        test: ActiveDualTest,
+        sample: Optional[ImuSample],
+    ) -> OrientationVisualState:
+        q_imu_relative = (
+            relative_quaternion(test.initial_q, sample.q)
+            if sample is not None
+            else (1.0, 0.0, 0.0, 0.0)
+        )
+        m1_command, m2_command = self._dual_command_rotations(test)
+        q_fk_target = self._dual_fk_relative_quaternion(
+            test,
+            test.m1_start_deg + m1_command,
+            test.m2_start_deg + m2_command,
+        )
+        command_source = (
+            "FK quantized final target"
+            if test.m1_pulses is not None and test.m2_pulses is not None
+            else "FK requested final target"
+        )
+        return OrientationVisualState(
+            mode="dual",
+            imu_q=q_imu_relative,
+            target_q=q_fk_target,
+            target_label=command_source,
+            imu_label="BNO085 live Δq",
+            status_line=(
+                "The green pose is the final open-loop FK target. The STM32 does not "
+                "report in-motion motor positions, so only the blue BNO085 pose is live."
+            ),
+        )
+
+    def _current_orientation_visual_state(
+        self,
+        sample: Optional[ImuSample] = None,
+    ) -> OrientationVisualState:
+        live_sample = sample if sample is not None else self.latest
+        if self.active_test is not None:
+            return self._single_orientation_visual_state(self.active_test, live_sample)
+        if self.active_dual_test is not None:
+            return self._dual_orientation_visual_state(self.active_dual_test, live_sample)
+        if self._pinned_orientation_state is not None:
+            return self._pinned_orientation_state
+
+        return OrientationVisualState(
+            mode="idle",
+            imu_q=None if live_sample is None else live_sample.q,
+            target_q=None,
+            target_label="",
+            imu_label="BNO085 live pose",
+            status_line="Live BNO085 orientation in its reported world reference frame.",
+        )
+
+    def _update_orientation_visualization(
+        self,
+        sample: Optional[ImuSample] = None,
+        *,
+        force: bool = False,
+    ) -> None:
+        canvas = self.orientation_canvas
+        if canvas is None:
+            return
+
+        now = time.monotonic()
+        if (
+            not force
+            and now - self._last_orientation_view_update_at
+            < ORIENTATION_VIEW_UPDATE_INTERVAL_S
+        ):
+            return
+
+        state = self._current_orientation_visual_state(sample)
+        try:
+            canvas.set_state(state)
+        except tk.TclError:
+            self.orientation_canvas = None
+            self.orientation_window = None
+            self.orientation_status = None
+            return
+
+        if self.orientation_status is not None:
+            self.orientation_status.set(state.status_line)
+        self._last_orientation_view_update_at = now
+
+    def _pin_orientation_visualization(self, state: OrientationVisualState) -> None:
+        self._pinned_orientation_state = state
+        self._update_orientation_visualization(force=True)
 
     def refresh_ports(self) -> None:
         ports = [port.device for port in list_ports.comports()]
@@ -805,6 +1734,7 @@ class App:
 
         self.track_motion_and_collect(sample)
         self.track_dual_motion_and_collect(sample)
+        self._update_orientation_visualization(sample)
 
     def track_motion_and_collect(self, sample: ImuSample) -> None:
         test = self.active_test
@@ -949,6 +1879,7 @@ class App:
                 f"{test.command_rotation_deg:+.3f}° ({pulses} pulses)"
             )
             self.test_state.set(f"Waiting for Motor {motor_id} movement")
+            self._update_orientation_visualization(force=True)
             return
 
         if line.startswith("DONE,MOVE,"):
@@ -1005,10 +1936,27 @@ class App:
             return
 
         if line.startswith("ACK,MOVE2,"):
+            parts = line.split(",")
             test = self.active_dual_test
-            if test is not None and not test.saw_motion:
-                test.state = "WAITING_MOTION"
-                self.test_state.set("Waiting for dual-motor movement")
+            if test is not None:
+                # ACK,MOVE2,d1,requested1,pulses1,d2,requested2,pulses2
+                if len(parts) == 8:
+                    try:
+                        d1 = int(parts[2])
+                        p1 = int(parts[4])
+                        d2 = int(parts[5])
+                        p2 = int(parts[7])
+                    except ValueError:
+                        pass
+                    else:
+                        test.m1_pulses = p1
+                        test.m2_pulses = p2
+                        test.m1_command_deg = d1 * p1 * 360.0 / MOTOR_PULSES_PER_REV
+                        test.m2_command_deg = d2 * p2 * 360.0 / MOTOR_PULSES_PER_REV
+                if not test.saw_motion:
+                    test.state = "WAITING_MOTION"
+                    self.test_state.set("Waiting for dual-motor movement")
+                self._update_orientation_visualization(force=True)
             self.status.set("Both motors accepted the command and started.")
             return
 
@@ -1059,6 +2007,7 @@ class App:
                 self.status.set(
                     "Dual-motor move complete. Averaging final stationary IMU data."
                 )
+                self._update_orientation_visualization(force=True)
 
                 if len(test.final_samples) >= target:
                     self.finish_dual_test()
@@ -1195,6 +2144,8 @@ class App:
             initial_q=initial_q,
             sample_count=count,
         )
+        self._pinned_orientation_state = None
+        self.show_orientation_view()
 
         self.result_motor.set(f"Motor {motor_id}")
         self.software_start.set(f"{software_start:+.3f}°")
@@ -1212,6 +2163,7 @@ class App:
         self.percent_error.set("--")
         self.test_state.set("Waiting for ACK")
         self._set_run_controls(False)
+        self._update_orientation_visualization(force=True)
 
         command = f"MOVE,{motor_id},{direction:+d},{requested_move:.4f}"
         if not self.send_stm(command):
@@ -1313,6 +2265,8 @@ class App:
             m1_sample_count=count1,
             m2_sample_count=count2,
         )
+        self._pinned_orientation_state = None
+        self.show_orientation_view()
 
         command = (
             f"MOVE2,{direction1:+d},{angle1:.4f},"
@@ -1321,6 +2275,7 @@ class App:
 
         self.test_state.set("Dual test: waiting for ACK")
         self._set_run_controls(False)
+        self._update_orientation_visualization(force=True)
 
         if not self.send_stm(command):
             self.abort_dual_test("Failed to send MOVE2")
@@ -1439,19 +2394,7 @@ class App:
         # when the dual test was started.
         final_q = mean_quaternion([sample.q for sample in test.final_samples])
 
-        m1_axis_index = AXIS_INDEX[test.m1_axis_name]
-        m2_axis_index = AXIS_INDEX[test.m2_axis_name]
-
-        m1_command = (
-            test.m1_command_deg
-            if test.m1_command_deg is not None
-            else test.m1_direction * test.m1_requested_deg
-        )
-        m2_command = (
-            test.m2_command_deg
-            if test.m2_command_deg is not None
-            else test.m2_direction * test.m2_requested_deg
-        )
+        m1_command, m2_command = self._dual_command_rotations(test)
 
         end1 = self.motor_position_deg[1]
         end2 = self.motor_position_deg[2]
@@ -1464,23 +2407,7 @@ class App:
         # with FK, compare the resulting pose change with the BNO085 pose
         # change, then take the shortest quaternion error rotation.  No
         # inverse-kinematics or per-joint error is used here.
-        q_motor_initial = dual_axis_forward_kinematics(
-            m1_axis_index,
-            test.m1_start_deg,
-            test.m1_axis_sign,
-            m2_axis_index,
-            test.m2_start_deg,
-            test.m2_axis_sign,
-        )
-        q_motor_final = dual_axis_forward_kinematics(
-            m1_axis_index,
-            end1,
-            test.m1_axis_sign,
-            m2_axis_index,
-            end2,
-            test.m2_axis_sign,
-        )
-        q_motor_relative = relative_quaternion(q_motor_initial, q_motor_final)
+        q_motor_relative = self._dual_fk_relative_quaternion(test, end1, end2)
         q_imu_relative = relative_quaternion(test.initial_q, final_q)
         q_error = relative_quaternion(q_motor_relative, q_imu_relative)
         orientation_error_deg = quaternion_rotation_magnitude_deg(q_error)
@@ -1564,12 +2491,29 @@ class App:
             "orientation_error_deg": orientation_error_deg,
         }
 
+        final_visual_state = OrientationVisualState(
+            mode="dual",
+            imu_q=q_imu_relative,
+            target_q=q_motor_relative,
+            target_label="FK predicted Δq (final software positions)",
+            imu_label="BNO085 averaged Δq",
+            status_line=(
+                "Final FK-versus-IMU quaternion comparison is pinned. "
+                "Choose ‘Show Current Live Pose’ to resume raw live display."
+            ),
+            error_q=q_error,
+            error_axis=error_axis,
+            final_error_deg=orientation_error_deg,
+            is_final=True,
+        )
+
         self.active_dual_test = None
         self._set_run_controls(True)
         self.test_state.set("Dual complete")
         self.status.set(
             f"Dual complete: 3D orientation error {orientation_error_deg:.3f}°."
         )
+        self._pin_orientation_visualization(final_visual_state)
         self.show_dual_result_window(result_data)
 
     def show_dual_result_window(self, data: dict[str, object]) -> None:
@@ -1685,18 +2629,25 @@ class App:
         button_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         button_row.columnconfigure(0, weight=1)
         button_row.columnconfigure(1, weight=1)
+        button_row.columnconfigure(2, weight=1)
 
         ttk.Button(
             button_row,
             text="Save Results CSV",
             command=self.save_results,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        ttk.Button(
+            button_row,
+            text="Open 3D View",
+            command=self.show_orientation_view,
+        ).grid(row=0, column=1, sticky="ew", padx=4)
 
         ttk.Button(
             button_row,
             text="Close",
             command=window.destroy,
-        ).grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         window.lift()
         window.focus_force()
@@ -1706,6 +2657,7 @@ class App:
         self._set_run_controls(True)
         self.test_state.set("Dual aborted")
         self.status.set(f"Dual test aborted: {reason}")
+        self._update_orientation_visualization(force=True)
 
     def finish_test(self) -> None:
         test = self.active_test
@@ -1793,14 +2745,34 @@ class App:
             f"{test.command_rotation_deg:+.3f}°, IMU {measured:+.3f}°, "
             f"error {signed_error:+.3f}°."
         )
+        final_visual_state = OrientationVisualState(
+            mode="single",
+            imu_q=q_relative,
+            target_q=axis_angle_quaternion(
+                test.axis_index,
+                test.command_rotation_deg * test.imu_axis_sign,
+            ),
+            target_label="Quantized command target Δq",
+            imu_label="BNO085 averaged Δq",
+            status_line=(
+                "Final single-axis view is pinned. Choose ‘Show Current Live Pose’ "
+                "to resume the raw BNO085 orientation display."
+            ),
+            axis_name=test.axis_name,
+            target_axis_deg=test.command_rotation_deg,
+            live_axis_deg=measured,
+            is_final=True,
+        )
         self.active_test = None
         self._set_run_controls(True)
+        self._pin_orientation_visualization(final_visual_state)
 
     def abort_test(self, reason: str) -> None:
         self.active_test = None
         self._set_run_controls(True)
         self.test_state.set("Aborted")
         self.status.set(f"Test aborted: {reason}")
+        self._update_orientation_visualization(force=True)
 
     def _set_run_controls(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
